@@ -11,7 +11,7 @@ from modules.hypernetworks import hypernetwork
 not_available = ["hardswish", "multiheadattention"]
 keys = list(x for x in hypernetwork.HypernetworkModule.activation_dict.keys() if x not in not_available)
 
-def create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure=None, activation_func=None, weight_init=None, add_layer_norm=False, use_dropout=False):
+def create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure=None, activation_func=None, weight_init=None, add_layer_norm=False, use_dropout=False, classic_training=False, dropout_strength=0.3):
     # Remove illegal characters from name.
     name = "".join( x for x in name if (x.isalnum() or x in "._- "))
 
@@ -30,6 +30,10 @@ def create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure=None,
         weight_init=weight_init,
         add_layer_norm=add_layer_norm,
         use_dropout=use_dropout,
+		classic_training = classic_training,
+		dropout_strength = dropout_strength,
+		activate_output = classic_training,
+		last_layer_dropout = not classic_training
     )
     hypernet.save(fn)
 

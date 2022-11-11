@@ -38,7 +38,7 @@ class HypernetworkModule(torch.nn.Module):
     activation_dict.update({cls_name.lower(): cls_obj for cls_name, cls_obj in inspect.getmembers(torch.nn.modules.activation) if inspect.isclass(cls_obj) and cls_obj.__module__ == 'torch.nn.modules.activation'})
 
     def __init__(self, dim, state_dict=None, layer_structure=None, activation_func=None, weight_init='Normal',
-                 add_layer_norm=False, use_dropout=False, activate_output=False, last_layer_dropout=True):
+                 add_layer_norm=False, use_dropout=False, activate_output=False, last_layer_dropout=True, dropout_strength=0.3, classic_training=False):
         super().__init__()
 
         assert layer_structure is not None, "layer_structure must not be None"
@@ -51,8 +51,8 @@ class HypernetworkModule(torch.nn.Module):
             # Add a fully-connected layer
             linears.append(torch.nn.Linear(int(dim * layer_structure[i]), int(dim * layer_structure[i+1])))
 
-            # Add an activation func except last layer
-            if activation_func == "linear" or activation_func is None or (i >= len(layer_structure) - 2 and not activate_output):
+            # Add an activation func except last layer - and only when we're not using classic training
+            if (activation_func == "linear" or activation_func is None or (i >= len(layer_structure) - 2 and not activate_output) and not classic_training):
                 pass
             elif activation_func in self.activation_dict:
                 linears.append(self.activation_dict[activation_func]())
@@ -64,8 +64,8 @@ class HypernetworkModule(torch.nn.Module):
                 linears.append(torch.nn.LayerNorm(int(dim * layer_structure[i+1])))
 
             # Add dropout except last layer
-            if use_dropout and (i < len(layer_structure) - 3 or last_layer_dropout and i < len(layer_structure) - 2):
-                linears.append(torch.nn.Dropout(p=0.3))
+            if use_dropout and ((i < len(layer_structure) - 3 or last_layer_dropout and i < len(layer_structure) - 2) and not classic_training):
+                linears.append(torch.nn.Dropout(p=dropout_strength))
 
         self.linear = torch.nn.Sequential(*linears)
 
@@ -78,7 +78,10 @@ class HypernetworkModule(torch.nn.Module):
                     w, b = layer.weight.data, layer.bias.data
                     if weight_init == "Normal" or type(layer) == torch.nn.LayerNorm:
                         normal_(w, mean=0.0, std=0.01)
-                        normal_(b, mean=0.0, std=0)
+                        if classic_training:
+                            normal_(b, mean=0.005, std=0)
+                        else:
+                            normal_(b, mean=0.0, std=0)
                     elif weight_init == 'XavierUniform':
                         xavier_uniform_(w)
                         zeros_(b)
@@ -130,7 +133,7 @@ class Hypernetwork:
     filename = None
     name = None
 
-    def __init__(self, name=None, enable_sizes=None, layer_structure=None, activation_func=None, weight_init=None, add_layer_norm=False, use_dropout=False, activate_output=False, **kwargs):
+    def __init__(self, name=None, enable_sizes=None, layer_structure=None, activation_func=None, weight_init=None, add_layer_norm=False, use_dropout=False, activate_output=False, classic_training=False, dropout_strength=0.3, **kwargs):
         self.filename = None
         self.name = name
         self.layers = {}
@@ -146,13 +149,17 @@ class Hypernetwork:
         self.last_layer_dropout = kwargs['last_layer_dropout'] if 'last_layer_dropout' in kwargs else True
         self.optimizer_name = None
         self.optimizer_state_dict = None
+        self.classic_training = classic_training
+        self.dropout_strength = dropout_strength
 
         for size in enable_sizes or []:
             self.layers[size] = (
                 HypernetworkModule(size, None, self.layer_structure, self.activation_func, self.weight_init,
-                                   self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout),
+                                   self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout,
+                                   classic_training=self.classic_training, dropout_strength=self.dropout_strength),
                 HypernetworkModule(size, None, self.layer_structure, self.activation_func, self.weight_init,
-                                   self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout),
+                                   self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout,
+                                   classic_training=self.classic_training, dropout_strength=self.dropout_strength),
             )
 
     def weights(self):
@@ -179,10 +186,12 @@ class Hypernetwork:
         state_dict['is_layer_norm'] = self.add_layer_norm
         state_dict['weight_initialization'] = self.weight_init
         state_dict['use_dropout'] = self.use_dropout
+        state_dict['dropout_strength'] = self.dropout_strength
         state_dict['sd_checkpoint'] = self.sd_checkpoint
         state_dict['sd_checkpoint_name'] = self.sd_checkpoint_name
         state_dict['activate_output'] = self.activate_output
         state_dict['last_layer_dropout'] = self.last_layer_dropout
+        state_dict['classic_training'] = self.classic_training
 
         if self.optimizer_name is not None:
             optimizer_saved_dict['optimizer_name'] = self.optimizer_name
@@ -210,9 +219,16 @@ class Hypernetwork:
         print(f"Layer norm is set to {self.add_layer_norm}")
         self.use_dropout = state_dict.get('use_dropout', False)
         print(f"Dropout usage is set to {self.use_dropout}" )
+        self.dropout_strength = state_dict.get('dropout_strength', 0.3)
+        print(f"Dropout strength is set to {self.dropout_strength}")
         self.activate_output = state_dict.get('activate_output', True)
         print(f"Activate last layer is set to {self.activate_output}")
         self.last_layer_dropout = state_dict.get('last_layer_dropout', False)
+        print(f"Last layer dropout is set to {self.last_layer_dropout}")
+        self.classic_training = state_dict.get('classic_training', False)
+        # Emit warning on loading an old or "classic" trained hypernetwork
+        if self.classic_training or not self.last_layer_dropout or self.last_layer_dropout == None:
+            print(f"This hypernetwork is trained from an old version of webui, or used the 'Classic Training' checkbox or is from an unusual origin. Training this hypernetwork may cause unintended issues.")
 
         optimizer_saved_dict = torch.load(self.filename + '.optim', map_location = 'cpu') if os.path.exists(self.filename + '.optim') else {}
         self.optimizer_name = optimizer_saved_dict.get('optimizer_name', 'AdamW')
@@ -230,9 +246,11 @@ class Hypernetwork:
             if type(size) == int:
                 self.layers[size] = (
                     HypernetworkModule(size, sd[0], self.layer_structure, self.activation_func, self.weight_init,
-                                       self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout),
+                                       self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout,
+                                       classic_training=self.classic_training, dropout_strength=self.dropout_strength),
                     HypernetworkModule(size, sd[1], self.layer_structure, self.activation_func, self.weight_init,
-                                       self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout),
+                                       self.add_layer_norm, self.use_dropout, self.activate_output, last_layer_dropout=self.last_layer_dropout,
+                                       classic_training=self.classic_training, dropout_strength=self.dropout_strength)
                 )
 
         self.name = state_dict.get('name', self.name)
